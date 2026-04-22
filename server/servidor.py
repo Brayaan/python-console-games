@@ -1,3 +1,7 @@
+# Módulo principal del servidor multijugador.
+# Gestiona las conexiones TCP entrantes, el ciclo de vida de las salas de juego,
+# el enrutamiento de mensajes por tipo (protocolo JSON sobre TCP) y las
+# estadísticas de partida en memoria.
 import socket
 import threading
 import uuid
@@ -13,25 +17,44 @@ DEBUG = False
 
 
 class SalaJuego:
-    """Representa una sala de juego con 2 jugadores"""
+    """Representa una sala de espera/juego con capacidad para 2 jugadores.
+
+    Almacena los sockets y nombres de ambos jugadores, el estado de la sala
+    (ESPERANDO → JUGANDO → TERMINADO) y la instancia del juego activo.
+    """
 
     def __init__(self, juego_id, nombre_juego):
-        self.id = str(uuid.uuid4())[:8]
+        self.id = str(uuid.uuid4())[:8]     # ID único de 8 chars para identificar la sala
         self.juego_id = juego_id
         self.nombre_juego = nombre_juego
-        self.jugadores = {}  # {id: {"socket": socket, "nombre": nombre}}
-        self.estado = "ESPERANDO"  # ESPERANDO, JUGANDO, TERMINADO
+        self.jugadores = {}                  # {jugador_id: {"socket": socket, "nombre": str}}
+        self.estado = "ESPERANDO"            # Máquina de estados: ESPERANDO → JUGANDO → TERMINADO
         self.juego = None
 
+        # Instanciar el juego concreto según el ID seleccionado por el creador
         if juego_id == "1":
             self.juego = Triqui()
         elif juego_id == "3":
             self.juego = Conecta4()
 
     def agregar_jugador(self, jugador_id, socket_cliente, nombre):
+        """Registra un jugador en la sala si aún hay espacio.
+
+        Cuando se alcanza el cupo de 2, transiciona el estado a JUGANDO e
+        inicializa la lógica del juego con los IDs de ambos jugadores.
+
+        Args:
+            jugador_id: ID único del jugador (str UUID truncado).
+            socket_cliente: Socket TCP del cliente.
+            nombre: Nombre de pantalla del jugador.
+
+        Returns:
+            True si el jugador fue agregado exitosamente, False si la sala está llena.
+        """
         if len(self.jugadores) < 2:
             self.jugadores[jugador_id] = {"socket": socket_cliente, "nombre": nombre}
             if len(self.jugadores) == 2:
+                # Segunda conexión: arrancar el juego con ambos IDs
                 self.estado = "JUGANDO"
                 self.juego.iniciar(list(self.jugadores.keys()))
                 print(f"[JUEGO] Sala {self.id} lista para jugar")
@@ -39,13 +62,29 @@ class SalaJuego:
         return False
 
     def obtener_oponente(self, jugador_id):
+        """Retorna el ID del jugador contrario al indicado.
+
+        Args:
+            jugador_id: ID del jugador de referencia.
+
+        Returns:
+            ID del oponente, o None si la sala tiene menos de 2 jugadores.
+        """
         for jid in self.jugadores:
             if jid != jugador_id:
                 return jid
         return None
 
     def broadcast(self, mensaje, excluir=None):
-        """Envía un mensaje a todos los jugadores de la sala"""
+        """Envía un mensaje JSON a todos los jugadores de la sala.
+
+        Los errores de envío se ignoran silenciosamente para no interrumpir
+        la notificación al resto de jugadores (p.ej., si uno ya se desconectó).
+
+        Args:
+            mensaje: Dict serializable a JSON que se enviará.
+            excluir: ID de jugador que debe omitirse del envío (opcional).
+        """
         for jid, datos in self.jugadores.items():
             if excluir and jid == excluir:
                 continue
@@ -53,23 +92,33 @@ class SalaJuego:
                 if datos["socket"]:
                     Protocolo.enviar(datos["socket"], mensaje)
             except Exception:
-                pass
+                pass  # Ignorar fallos individuales: el resto sí recibe el mensaje
 
 
 class ServidorJuegos:
+    """Servidor TCP multijugador que gestiona salas, partidas y estadísticas.
+
+    Cada cliente que se conecta recibe un hilo dedicado (manejar_cliente).
+    La comunicación se realiza mediante el protocolo de framing definido en
+    utils.protocolo (cabecera de 4 bytes + payload JSON). El acceso a las
+    estructuras compartidas (salas, jugadores, nombres_activos) se protege
+    con un threading.Lock para evitar condiciones de carrera.
+    """
 
     def __init__(self, host="0.0.0.0", puerto=8888):
         self.host = host
         self.puerto = puerto
+        # Socket TCP IPv4; SO_REUSEADDR permite reutilizar el puerto tras reinicio
         self.socket_servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket_servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket_servidor.bind((self.host, self.puerto))
 
-        self.salas = {}       # {sala_id: SalaJuego}
-        self.jugadores = {}   # {jugador_id: {"sala": sala_id, "socket": socket}}
-        self.nombres_activos = set()
-        self.lock = threading.Lock()
+        self.salas = {}            # {sala_id: SalaJuego}  — salas activas
+        self.jugadores = {}        # {jugador_id: {"sala": sala_id, "socket": socket, "nombre": str}}
+        self.nombres_activos = set()  # Nombres de pantalla registrados y en sesión
+        self.lock = threading.Lock()  # Mutex para acceso concurrente a estructuras compartidas
 
+        # Catálogo de juegos disponibles: clave = juego_id (str), valor = nombre legible
         self.juegos_disponibles = {
             "1": "Triqui (3 en linea)",
             "3": "Conecta 4"
@@ -77,13 +126,30 @@ class ServidorJuegos:
 
 
     def _asegurar_entrada(self, nombre):
-        """Crea la entrada de estadisticas para un jugador si todavia no existe."""
+        """Crea la entrada de estadísticas para un jugador si todavía no existe.
+
+        Se llama antes de incrementar cualquier contador para garantizar que
+        el dict del jugador siempre esté inicializado con todos los campos.
+
+        Args:
+            nombre: Nombre de pantalla del jugador (puede ser None, en cuyo caso no hace nada).
+        """
         if nombre and nombre not in self.estadisticas:
             self.estadisticas[nombre] = {
                 "jugadas": 0, "ganadas": 0, "perdidas": 0, "empates": 0
             }
 
     def registrar_estadisticas_partida(self, sala, ganador_id):
+        """Actualiza las estadísticas en memoria al finalizar una partida.
+
+        Incrementa 'jugadas' para ambos jugadores. Si hay ganador, incrementa
+        'ganadas' para el ganador y 'perdidas' para el perdedor. En caso de
+        empate (ganador_id=None), incrementa 'empates' para ambos.
+
+        Args:
+            sala: Instancia SalaJuego con los datos de los jugadores.
+            ganador_id: ID del jugador ganador, o None en caso de empate.
+        """
         jugador1_id, jugador2_id = list(sala.jugadores.keys())
         nombre1 = sala.jugadores[jugador1_id].get("nombre")
         nombre2 = sala.jugadores[jugador2_id].get("nombre")
@@ -100,7 +166,7 @@ class ServidorJuegos:
             perdedor_id = sala.obtener_oponente(ganador_id)
             perdedor_nombre = sala.jugadores[perdedor_id].get("nombre") if perdedor_id else None
 
-            # Crear entrada si no existia (cubre jugadores sin nombre en el dict aun)
+            # Crear entrada si no existía (cubre jugadores que aún no tienen registro)
             self._asegurar_entrada(ganador_nombre)
             self._asegurar_entrada(perdedor_nombre)
 
@@ -109,14 +175,21 @@ class ServidorJuegos:
             if perdedor_nombre:
                 self.estadisticas[perdedor_nombre]["perdidas"] += 1
         else:
-            # Empate
+            # Empate: sumar 1 a 'empates' de cada jugador
             for nombre in [nombre1, nombre2]:
                 self._asegurar_entrada(nombre)
                 if nombre:
                     self.estadisticas[nombre]["empates"] += 1
 
     def iniciar(self):
-        self.estadisticas = {}  # estadisticas solo en memoria, se reinician con el servidor
+        """Inicia el servidor y entra en el bucle principal de aceptación de conexiones.
+
+        Las estadísticas se inicializan aquí (en memoria): se reinician cada vez
+        que el proceso del servidor arranca. Por cada cliente aceptado se lanza
+        un hilo daemon que ejecuta manejar_cliente(); el daemon=True garantiza que
+        los hilos no impidan el cierre del proceso principal.
+        """
+        self.estadisticas = {}   # Estadísticas solo en memoria: se reinician con el servidor
         self.socket_servidor.listen(5)
         print(f"[SERVER] Servidor iniciado en {self.host}:{self.puerto}")
         print("[SERVER] Esperando conexiones...")
@@ -124,53 +197,68 @@ class ServidorJuegos:
         while True:
             cliente, direccion = self.socket_servidor.accept()
             print(f"[CONEXION] Nueva conexion desde {direccion}")
+            # Hilo daemon: se cierra automáticamente si el proceso principal termina
             hilo = threading.Thread(target=self.manejar_cliente, args=(cliente, direccion))
             hilo.daemon = True
             hilo.start()
 
     def manejar_cliente(self, socket_cliente, direccion):
-        """Maneja la comunicacion con un cliente"""
+        """Bucle de recepción y enrutamiento de mensajes para un cliente.
+
+        Se ejecuta en un hilo dedicado por cliente. Recibe mensajes del protocolo,
+        los despacha al manejador correspondiente según su campo 'tipo' y, al
+        terminar (error o desconexión), llama a desconectar_jugador() para limpiar
+        las estructuras compartidas.
+
+        Args:
+            socket_cliente: Socket TCP del cliente conectado.
+            direccion: Tupla (host, puerto) del cliente (para logs).
+        """
         jugador_id = str(uuid.uuid4())[:8]
         print(f"[ID] Jugador {jugador_id} conectado desde {direccion}")
 
         try:
             while True:
+                # Esperar el siguiente mensaje del cliente (bloqueante)
                 mensaje = Protocolo.recibir(socket_cliente)
                 if not mensaje:
-                    break
+                    break  # El cliente se desconectó
 
                 tipo = mensaje.get("tipo", "")
                 print(f"[MENSAJE] [{jugador_id}] {tipo}")
 
                 if tipo == "REGISTRAR_NOMBRE":
                     nombre = mensaje["datos"]["nombre"]
-                    with self.lock:
+                    with self.lock:  # Proteger acceso a nombres_activos
                         if nombre in self.nombres_activos:
+                            # El nombre ya lo usa otro jugador conectado
                             Protocolo.enviar(socket_cliente, {
                                 "tipo": "ERROR",
                                 "datos": {"mensaje": "Nombre ya en uso. Elige otro."}
                             })
                         else:
                             if jugador_id in self.jugadores and self.jugadores[jugador_id].get("nombre"):
+                                # El jugador ya tenía nombre: actualizar y liberar el anterior
                                 old_name = self.jugadores[jugador_id]["nombre"]
                                 if old_name in self.nombres_activos:
                                     self.nombres_activos.remove(old_name)
                                 self.jugadores[jugador_id]["nombre"] = nombre
 
-                                # Transferir estadisticas del nombre anterior al nuevo
+                                # Transferir estadísticas del nombre anterior al nuevo
                                 if old_name in self.estadisticas:
                                     old_stats = self.estadisticas.pop(old_name)
                                     if nombre in self.estadisticas:
-                                        # El nombre nuevo ya tenia stats: sumar campo a campo
+                                        # El nombre nuevo ya tenía stats: sumar campo a campo
                                         for campo in ("jugadas", "ganadas", "perdidas", "empates"):
                                             self.estadisticas[nombre][campo] = (
                                                 self.estadisticas[nombre].get(campo, 0)
                                                 + old_stats.get(campo, 0)
                                             )
                                     else:
-                                        # Sin historial previo: mover directamente
+                                        # Sin historial previo: mover el registro directamente
                                         self.estadisticas[nombre] = old_stats
                             else:
+                                # Primera vez que este jugador registra un nombre
                                 self.jugadores[jugador_id] = {
                                     "sala": None, "socket": socket_cliente, "nombre": nombre
                                 }
@@ -206,6 +294,7 @@ class ServidorJuegos:
         except Exception as e:
             print(f"[ERROR] Error con jugador {jugador_id}: {e}")
         finally:
+            # Limpiar la sesión del jugador pase lo que pase
             self.desconectar_jugador(jugador_id)
             try:
                 socket_cliente.close()
@@ -213,12 +302,23 @@ class ServidorJuegos:
                 pass
 
     def enviar_lista_juegos(self, socket_cliente):
+        """Envía el catálogo de juegos disponibles al cliente que lo solicitó."""
         Protocolo.enviar(socket_cliente, {
             "tipo": "LISTA_JUEGOS",
             "datos": self.juegos_disponibles
         })
 
     def crear_sala(self, socket_cliente, jugador_id, datos):
+        """Crea una nueva sala de juego y añade al jugador como primer participante.
+
+        Valida que el juego_id sea un número conocido. La normalización a str(int())
+        es necesaria porque JSON puede transmitirlo como int o str según el cliente.
+
+        Args:
+            socket_cliente: Socket del cliente que crea la sala.
+            jugador_id: ID del jugador creador.
+            datos: Dict con 'juego_id' (int o str).
+        """
         with self.lock:
             # Normalizar a str: JSON convierte claves a str, y el cliente puede
             # enviar int o str segun el camino de codigo. str(int()) valida que
@@ -258,6 +358,16 @@ class ServidorJuegos:
                 print(f"[JUEGO] Sala {sala.id} creada por {nombre_jugador}")
 
     def unirse_sala(self, socket_cliente, jugador_id, datos):
+        """Une a un jugador a una sala existente en estado ESPERANDO.
+
+        Si la sala completa su cupo (2 jugadores), llama a iniciar_partida().
+        En caso de error (sala no encontrada o llena), notifica al cliente.
+
+        Args:
+            socket_cliente: Socket del cliente que se une.
+            jugador_id: ID del jugador que solicita unirse.
+            datos: Dict con 'sala_id' de la sala destino.
+        """
         with self.lock:
             sala_id = datos["sala_id"]
             nombre_jugador = self.jugadores.get(jugador_id, {}).get("nombre", f"Jugador_{jugador_id[:4]}")
@@ -323,20 +433,24 @@ class ServidorJuegos:
             })
 
     def procesar_movimiento(self, jugador_id, mensaje):
-        """Procesa un movimiento de un jugador"""
+        """Valida el turno y delega el movimiento al juego; luego notifica a ambos jugadores."""
+        # Ignorar si el jugador no está registrado en el servidor
         if jugador_id not in self.jugadores:
             if DEBUG:
                 print(f"[DEBUG] procesar_movimiento: jugador {jugador_id} no encontrado")
             return
 
+        # Obtener la sala donde está jugando este jugador
         sala_id = self.jugadores[jugador_id].get("sala")
         sala = self.salas.get(sala_id) if sala_id else None
 
+        # Solo procesar si la sala existe y la partida está en curso
         if not sala or sala.estado != "JUGANDO":
             if DEBUG:
                 print(f"[DEBUG] procesar_movimiento: sala invalida o no jugando (sala={sala_id}, estado={sala.estado if sala else 'N/A'})")
             return
 
+        # Rechazar el movimiento si no es el turno de este jugador
         if sala.juego.turno != jugador_id:
             if DEBUG:
                 print(f"[DEBUG] No es turno de {jugador_id}, turno actual={sala.juego.turno}")
@@ -349,12 +463,15 @@ class ServidorJuegos:
         movimiento = mensaje["datos"]["movimiento"]
         if DEBUG:
             print(f"[DEBUG] Procesando movimiento '{movimiento}' de {jugador_id} en sala {sala_id}")
+
+        # Pasar el movimiento al juego para que lo valide y lo aplique
         valido, resultado = sala.juego.procesar_movimiento(jugador_id, movimiento)
         if DEBUG:
             print(f"[DEBUG] Resultado: valido={valido}, resultado={resultado}")
 
         if valido:
             if resultado.get("terminado"):
+                # La partida terminó: notificar a ambos jugadores y limpiar la sala
                 sala.estado = "TERMINADO"
                 ganador = resultado.get("ganador")
                 print(f"[TERMINADO] Sala {sala.id}. Ganador: {ganador}")
@@ -370,6 +487,7 @@ class ServidorJuegos:
                 # Limpiar sala de memoria una vez notificados ambos jugadores
                 self._terminar_sala(sala_id)
             else:
+                # La partida continúa: enviar el tablero actualizado a cada jugador
                 for jid in sala.jugadores:
                     print(f"[MENSAJE] Enviando ACTUALIZACION a {jid}")
                     Protocolo.enviar(sala.jugadores[jid]["socket"], {
@@ -385,6 +503,7 @@ class ServidorJuegos:
                         }
                     })
         else:
+            # Movimiento inválido: notificar solo al jugador que lo envió
             print(f"[ERROR] Movimiento invalido de {jugador_id}: {movimiento} - {resultado.get('error', '')}")
             Protocolo.enviar(self.jugadores[jugador_id]["socket"], {
                 "tipo": "ERROR",
@@ -392,10 +511,11 @@ class ServidorJuegos:
             })
 
     def enviar_lista_salas(self, socket_cliente):
-        """Envia la lista de salas disponibles"""
+        """Envía solo las salas que aún esperan un segundo jugador."""
         salas_disponibles = {}
         with self.lock:
             for sala_id, sala in self.salas.items():
+                # Solo incluir salas en espera con exactamente 1 jugador
                 if sala.estado == "ESPERANDO" and len(sala.jugadores) == 1:
                     creador = list(sala.jugadores.values())[0]["nombre"] or "Desconocido"
                     salas_disponibles[sala_id] = {
@@ -410,15 +530,28 @@ class ServidorJuegos:
         })
 
     def enviar_chat(self, jugador_id, mensaje):
-        """Envia un mensaje de chat a la sala"""
+        """Procesa y retransmite un mensaje de chat dentro de la sala del jugador.
+
+        Aplica un truncado a 200 caracteres y un filtro básico de palabras ofensivas.
+        Si el mensaje empieza con '/stats', responde con las estadísticas del rival
+        en lugar de hacer broadcast a la sala.
+
+        Args:
+            jugador_id: ID del jugador que envía el mensaje.
+            mensaje: Texto del mensaje (puede ser un comando /stats).
+        """
+        # Ignorar mensajes de jugadores no registrados
         if jugador_id not in self.jugadores:
             return
 
+        # Limitar la longitud del mensaje para evitar spam
         mensaje = mensaje[:200]
+        # Filtrar palabras ofensivas reemplazándolas por ***
         ofensivas = ["palabra1", "palabra2"]
         for bad in ofensivas:
             mensaje = re.sub(f"(?i){bad}", "***", mensaje)
 
+        # Si el mensaje es el comando /stats, responder con estadísticas del rival
         if mensaje.startswith("/stats"):
             sala_id = self.jugadores[jugador_id].get("sala")
             if sala_id:
@@ -430,20 +563,21 @@ class ServidorJuegos:
                         stats_op = self.estadisticas.get(nombre_op, {})
                         v = stats_op.get("ganadas", 0)
                         p = stats_op.get("jugadas", 0)
-                        pct = (v / p * 100) if p > 0 else 0
+                        pct = (v / p * 100) if p > 0 else 0  # Porcentaje de victorias
                         stats_str = f"[ESTADISTICAS] {nombre_op}: Partidas: {p} | Victorias: {v} | %: {pct:.1f}%"
                         Protocolo.enviar(self.jugadores[jugador_id]["socket"], {
                             "tipo": "STATS_RESPONSE",
                             "datos": {"mensaje": stats_str}
                         })
-            return
+            return  # No hacer broadcast del comando
 
+        # Mensaje normal: enviarlo a todos los jugadores de la sala
         sala_id = self.jugadores[jugador_id].get("sala")
         sala = self.salas.get(sala_id)
 
         if sala:
             nombre = self.jugadores[jugador_id].get("nombre", "Jugador")
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            timestamp = datetime.now().strftime("%H:%M:%S")  # Hora del mensaje
             sala.broadcast({
                 "tipo": "CHAT",
                 "datos": {
@@ -461,7 +595,7 @@ class ServidorJuegos:
         })
 
     def rendirse(self, jugador_id):
-        """Jugador se rinde"""
+        """Procesa la rendición: el oponente gana automáticamente."""
         if jugador_id not in self.jugadores:
             return
 
@@ -470,9 +604,11 @@ class ServidorJuegos:
 
         if sala and sala.estado == "JUGANDO":
             sala.estado = "TERMINADO"
+            # El ganador es el jugador que NO se rindió
             ganador = sala.obtener_oponente(jugador_id)
             print(f"[RENDICION] Jugador {jugador_id} se rindio en sala {sala.id}")
             self.registrar_estadisticas_partida(sala, ganador)
+            # Notificar a ambos jugadores el resultado
             sala.broadcast({
                 "tipo": "JUEGO_TERMINADO",
                 "datos": {
@@ -499,7 +635,7 @@ class ServidorJuegos:
             print(f"[LIMPIEZA] Sala {sala_id} eliminada tras fin de partida")
 
     def desconectar_jugador(self, jugador_id):
-        """Limpia cuando un jugador se desconecta"""
+        """Elimina al jugador del servidor y avisa a su oponente si había partida en curso."""
         with self.lock:
             if jugador_id not in self.jugadores:
                 return
@@ -508,6 +644,7 @@ class ServidorJuegos:
             nombre = self.jugadores[jugador_id].get("nombre")
             print(f"[DESCONEXION] Jugador {jugador_id} desconectado")
 
+            # Liberar el nombre para que otro jugador pueda usarlo
             if nombre:
                 if nombre in self.nombres_activos:
                     self.nombres_activos.remove(nombre)
@@ -516,8 +653,10 @@ class ServidorJuegos:
                 sala = self.salas[sala_id]
                 oponente = sala.obtener_oponente(jugador_id)
                 if oponente and oponente in self.jugadores:
+                    # Desvincular al oponente de la sala para que pueda unirse a otra
                     self.jugadores[oponente]["sala"] = None
                     try:
+                        # Notificar al oponente que el rival se fue
                         Protocolo.enviar(self.jugadores[oponente]["socket"], {
                             "tipo": "JUGADOR_DESCONECTADO",
                             "datos": {"jugador_id": jugador_id}
@@ -525,9 +664,11 @@ class ServidorJuegos:
                     except Exception:
                         pass
 
+                # Eliminar la sala del registro activo
                 del self.salas[sala_id]
                 print(f"[ELIMINADO] Sala {sala_id} eliminada")
 
+            # Eliminar al jugador del registro del servidor
             del self.jugadores[jugador_id]
 
 

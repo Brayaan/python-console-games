@@ -1,3 +1,6 @@
+# Módulo del cliente multijugador.
+# Gestiona la conexión TCP al servidor, el hilo de escucha en segundo plano y
+# la interfaz de usuario en consola (menús, tableros, chat y modo partida).
 import socket
 import threading
 import sys
@@ -10,45 +13,61 @@ DEBUG = False
 
 
 class Colores:
-    HEADER = "\033[95m"
-    AZUL = "\033[94m"
-    VERDE = "\033[92m"
-    AMARILLO = "\033[93m"
-    ROJO = "\033[91m"
-    CYAN = "\033[96m"
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
+    """Constantes de escape ANSI para colorear la salida en la terminal."""
+    HEADER    = "\033[95m"
+    AZUL      = "\033[94m"
+    VERDE     = "\033[92m"
+    AMARILLO  = "\033[93m"
+    ROJO      = "\033[91m"
+    CYAN      = "\033[96m"
+    RESET     = "\033[0m"
+    BOLD      = "\033[1m"
     UNDERLINE = "\033[4m"
 
 
 class ClienteJuegos:
+    """Cliente de consola para el servidor de juegos multijugador.
+
+    Mantiene la conexión TCP, lanza un hilo daemon que escucha mensajes
+    del servidor y expone métodos de UI (menús, tableros, chat) ejecutados
+    en el hilo principal para evitar condiciones de carrera con input().
+    """
 
     def __init__(self, host="localhost", puerto=8888):
         self.host = host
         self.puerto = puerto
-        self.socket = None
-        self.conectado = False
-        self.jugador_id = None
-        self.sala_id = None
-        self.juego_actual = None
-        self.nombre = None
-        self.en_partida = False
-        self.nombre_registrado = False
-        self.ultimo_error = None
-        self.historial_chat = []
-        self.nuevo_mensaje_chat = False
-        self.evento_respuesta = threading.Event()
-        self.datos_recibidos = None
-        self.esperando_actualizacion = threading.Event()
-        self.rival_nombre = None
-        self.resultado_partida = None   # Guardado por hilo de fondo, mostrado por hilo principal
+        self.socket = None           # Conexión TCP con el servidor
+        self.conectado = False        # True mientras la conexión esté activa
+        self.jugador_id = None        # ID único asignado por el servidor
+        self.sala_id = None           # ID de la sala en la que está el jugador
+        self.juego_actual = None      # Datos del juego en curso (tablero, turno, etc.)
+        self.nombre = None            # Nombre de pantalla del jugador
+        self.en_partida = False       # True cuando hay una partida activa
+        self.nombre_registrado = False  # True una vez que el servidor confirmó el nombre
+        self.ultimo_error = None      # Último mensaje de error recibido del servidor
+        self.historial_chat = []      # Lista con los últimos mensajes del chat
+        self.nuevo_mensaje_chat = False  # Bandera para refrescar el chat en pantalla
+        self.evento_respuesta = threading.Event()   # Sincroniza respuestas del servidor con el hilo principal
+        self.datos_recibidos = None   # Datos de la última respuesta del servidor
+        self.esperando_actualizacion = threading.Event()  # Espera la confirmación del movimiento
+        self.rival_nombre = None      # Nombre del oponente
+        self.resultado_partida = None  # Guardado por hilo de fondo, mostrado por hilo principal
 
     def conectar(self):
+        """Establece la conexión TCP con el servidor y arranca el hilo de escucha.
+
+        El hilo daemon de escucha se detiene automáticamente cuando el proceso
+        principal termina o el socket se cierra.
+
+        Returns:
+            True si la conexión fue exitosa, False en caso contrario.
+        """
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((self.host, self.puerto))
             self.conectado = True
 
+            # Hilo daemon: muere junto con el proceso principal
             hilo = threading.Thread(target=self.escuchar_servidor)
             hilo.daemon = True
             hilo.start()
@@ -59,14 +78,18 @@ class ClienteJuegos:
             return False
 
     def escuchar_servidor(self):
+        """Bucle de recepción de mensajes que corre en el hilo daemon.
+
+        Llama a procesar_mensaje() por cada mensaje recibido del servidor.
+        Al detectar desconexión o error pone self.conectado=False para que
+        el hilo principal pueda salir de sus bucles de espera.
+        """
         while self.conectado:
             try:
                 mensaje = Protocolo.recibir(self.socket)
                 if not mensaje:
                     break
-
                 self.procesar_mensaje(mensaje)
-
             except Exception as e:
                 if self.conectado:
                     print(
@@ -78,6 +101,15 @@ class ClienteJuegos:
         print(f"\n{Colores.ROJO}[ADVERTENCIA] Desconectado del servidor{Colores.RESET}")
 
     def procesar_mensaje(self, mensaje):
+        """Despacha un mensaje recibido del servidor al manejador correspondiente.
+
+        Se ejecuta en el hilo daemon de escucha. Actualiza el estado interno
+        (en_partida, juego_actual, historial_chat, etc.) y señaliza los eventos
+        que el hilo principal usa para esperar respuestas sincrónicas.
+
+        Args:
+            mensaje: Dict deserializado del protocolo con al menos 'tipo' y 'datos'.
+        """
         if not mensaje or "tipo" not in mensaje:
             return
 
@@ -93,6 +125,7 @@ class ClienteJuegos:
             self.evento_respuesta.set()
 
         elif tipo == "SALA_CREADA":
+            # Guardar el ID de sala asignado por el servidor
             self.sala_id = datos["sala_id"]
             print(f"\n{Colores.VERDE}[OK] Sala creada: {datos['sala_id']}{Colores.RESET}")
             print(f"[JUEGO] Juego: {datos['juego']}")
@@ -120,10 +153,10 @@ class ClienteJuegos:
 
         elif tipo == "PARTIDA_INICIADA":
             self.en_partida = True
-            self.jugador_id = datos["tu_jugador_id"]
+            self.jugador_id = datos["tu_jugador_id"]  # Guardar el ID que nos asignó el servidor
             self.juego_actual = datos
             self.rival_nombre = datos.get("rival_nombre", "Rival")
-            # mostrar_tablero hace cls primero; el mensaje va DESPUES para que sea visible
+            # Mostrar tablero y luego indicar si es nuestro turno
             self.mostrar_tablero(datos["tablero"])
             print(
                 f"\n{Colores.BOLD}{Colores.VERDE}[JUEGO] !PARTIDA INICIADA!{Colores.RESET}"
@@ -180,6 +213,7 @@ class ClienteJuegos:
             # El hilo de fondo no toca la pantalla; _mostrar_resultado_final() lo muestra automaticamente.
 
         elif tipo == "JUGADOR_DESCONECTADO":
+            # El rival cerró la conexión: terminar la partida
             print(f"\n{Colores.ROJO}[ADVERTENCIA] El rival se ha desconectado{Colores.RESET}")
             self.en_partida = False
             print("")
@@ -211,14 +245,15 @@ class ClienteJuegos:
         elif tipo == "CHAT":
             jug = datos.get('jugador', '')
             msg = datos.get('mensaje', '')
-            ts = datos.get('timestamp', '')
-            linea = f"[{ts}] {jug}: {msg}"
+            ts  = datos.get('timestamp', '')
+            linea = f"[{ts}] {jug}: {msg}"  # Formato: [hora] nombre: mensaje
             self.historial_chat.append(linea)
-            if len(self.historial_chat) > 20:
+            if len(self.historial_chat) > 20:  # Mantener solo los últimos 20 mensajes
                 self.historial_chat.pop(0)
-            
+
             self.nuevo_mensaje_chat = True
             if self.en_partida:
+                # Si es el turno del rival, refrescar tablero para mostrar el nuevo mensaje
                 if getattr(self, "juego_actual", None) and self.juego_actual.get("turno") != self.jugador_id:
                     self.mostrar_tablero(self.juego_actual["tablero"])
                 else:
@@ -239,6 +274,11 @@ class ClienteJuegos:
             self.evento_respuesta.set()
 
     def mostrar_juegos(self, juegos):
+        """Imprime el catálogo de juegos disponibles recibido del servidor.
+
+        Args:
+            juegos: Dict {juego_id: nombre} con los juegos disponibles.
+        """
         if self.en_partida:
             return  # No mostrar mientras estás en partida
         print(f"\n{Colores.BOLD}{Colores.HEADER}[JUEGO] JUEGOS DISPONIBLES{Colores.RESET}")
@@ -249,6 +289,11 @@ class ClienteJuegos:
         print("")
 
     def mostrar_salas(self, salas):
+        """Imprime la lista de salas en estado ESPERANDO.
+
+        Args:
+            salas: Dict {sala_id: {juego, jugadores, creador}} recibido del servidor.
+        """
         if self.en_partida:
             return  # No mostrar mientras estás en partida
         if not salas:
@@ -265,6 +310,15 @@ class ClienteJuegos:
         print(f"{Colores.AMARILLO}0. Volver{Colores.RESET}\n")
 
     def mostrar_estadisticas(self, datos):
+        """Muestra las estadísticas de la sesión del jugador actual.
+
+        Calcula el porcentaje de victoria y formatea la salida con colores.
+        Si el jugador no tiene partidas registradas, muestra un aviso.
+
+        Args:
+            datos: Dict global de estadísticas recibido del servidor
+                   ({nombre: {jugadas, ganadas, perdidas, empates}}).
+        """
         if self.en_partida:
             return
             
@@ -277,12 +331,13 @@ class ClienteJuegos:
             print(f"{Colores.AMARILLO}0. Volver{Colores.RESET}\n")
             return
             
-        mis_stats = datos[self.nombre]
+        mis_stats = datos[self.nombre]   # Extraer solo las stats del jugador actual
         jugadas  = mis_stats.get('jugadas',  0)
         ganadas  = mis_stats.get('ganadas',  0)
         perdidas = mis_stats.get('perdidas', 0)
         empates  = mis_stats.get('empates',  0)
 
+        # Calcular porcentaje de victorias (evitar división por cero)
         porcentaje = (ganadas / jugadas * 100) if jugadas > 0 else 0.0
 
         print(f"{Colores.AZUL}Nombre:             {Colores.RESET} {self.nombre}")
@@ -294,12 +349,22 @@ class ClienteJuegos:
         print(f"\n{Colores.AMARILLO}0. Volver{Colores.RESET}\n")
 
     def mostrar_chat(self):
+        """Imprime las últimas 5 líneas del historial de chat de la sala."""
         print(f"\n{Colores.BOLD}───── CHAT ─────{Colores.RESET}")
         for msg in self.historial_chat[-5:]:
             print(msg)
         print(f"{Colores.BOLD}────────────────{Colores.RESET}")
 
     def mostrar_tablero(self, tablero_info):
+        """Limpia la pantalla y renderiza el tablero del juego activo.
+
+        Muestra primero el historial de chat, luego las identidades (nombre
+        y símbolo de cada jugador) y el tablero del juego concreto.
+
+        Args:
+            tablero_info: Dict con 'tipo' ('triqui' o 'conecta4') y los datos
+                          del tablero devueltos por JuegoBase.obtener_vista().
+        """
         os.system("clear" if os.name == "posix" else "cls")
 
         self.mostrar_chat()
@@ -323,6 +388,7 @@ class ClienteJuegos:
 
         tipo = tablero_info.get("tipo", "") if isinstance(tablero_info, dict) else ""
 
+        # Elegir el renderizador según el tipo de juego
         if tipo == "triqui":
             self.mostrar_tablero_triqui(tablero_info["tablero"])
         elif tipo == "conecta4":
@@ -330,6 +396,14 @@ class ClienteJuegos:
         
 
     def mostrar_tablero_triqui(self, tablero):
+        """Renderiza la cuadrícula 3×3 del Triqui con separadores gráficos.
+
+        Colorea X en verde y O en rojo. Imprime la guía de posiciones (1-9)
+        debajo del tablero para ayudar al jugador a elegir casilla.
+
+        Args:
+            tablero: Lista plana de 9 celdas (' ', 'X' u 'O').
+        """
         print("\n")
         for i in range(0, 9, 3):
             fila = []
@@ -354,6 +428,14 @@ class ClienteJuegos:
         print(f"\n{Colores.BOLD}Comandos: {Colores.RESET}{Colores.VERDE}[1-9]{Colores.RESET} mover  {Colores.CYAN}[C]{Colores.RESET} chat  {Colores.ROJO}[rendirse]{Colores.RESET} abandonar")
 
     def mostrar_tablero_conecta4(self, tablero):
+        """Renderiza la cuadrícula 6×7 del Conecta 4 con bordes Unicode.
+
+        Colorea R (Rojo) y A (Amarillo). La numeración de columnas (1-7)
+        se muestra en la cabecera para guiar la elección del jugador.
+
+        Args:
+            tablero: Lista de 6 listas (filas) de 7 celdas (' ', 'R' o 'A').
+        """
         print(f"\n{Colores.BOLD}   1   2   3   4   5   6   7{Colores.RESET}")
         print(f"{Colores.BOLD}  ┌───┬───┬───┬───┬───┬───┬───┐{Colores.RESET}")
         
@@ -378,6 +460,12 @@ class ClienteJuegos:
         print(f"\n{Colores.BOLD}Comandos: {Colores.RESET}{Colores.VERDE}[1-7]{Colores.RESET} columna  {Colores.CYAN}[C]{Colores.RESET} chat  {Colores.ROJO}[rendirse]{Colores.RESET} abandonar")
 
     def menu_principal(self):
+        """Bucle principal de navegación del cliente.
+
+        En cada iteración limpia la pantalla y muestra las opciones. Si
+        self.en_partida es True, cede el control a modo_partida() hasta que
+        la partida concluya y el resultado sea mostrado al usuario.
+        """
         while self.conectado:
             # Si entramos en partida, ceder el control al modo_partida
             if self.en_partida:
@@ -418,6 +506,12 @@ class ClienteJuegos:
                 continue
 
     def cambiar_nombre(self):
+        """Permite al jugador actualizar su nombre de pantalla.
+
+        Envía una solicitud REGISTRAR_NOMBRE al servidor y espera hasta 2 s
+        la confirmación. Si el nombre ya está en uso o hay un error, restaura
+        el estado anterior y muestra el mensaje de error correspondiente.
+        """
         os.system("clear" if os.name == "posix" else "cls")
         nombre = input(f"\n{Colores.VERDE}[CAMBIO NOMBRE] Ingrese nuevo nombre:{Colores.RESET}\n➤ ").strip()
         if nombre == "0":
@@ -427,20 +521,22 @@ class ClienteJuegos:
         if 3 <= len(nombre) <= 20:
             self.ultimo_error = None
             old_registrado = self.nombre_registrado
-            self.nombre_registrado = False
+            self.nombre_registrado = False  # Resetear para esperar la nueva confirmación
             Protocolo.enviar(self.socket, {
                 'tipo': 'REGISTRAR_NOMBRE',
                 'datos': {'nombre': nombre}
             })
+            # Esperar hasta 2 segundos por la respuesta del servidor (20 x 0.1s)
             for _ in range(20):
                 if self.nombre_registrado or self.ultimo_error or not self.conectado:
                     break
                 time.sleep(0.1)
-            
+
             if self.nombre_registrado:
                 self.nombre = nombre
                 print(f"{Colores.VERDE}[OK] Nombre cambiado a: {nombre}{Colores.RESET}")
             else:
+                # Revertir si el cambio falló
                 self.nombre_registrado = old_registrado
                 if self.ultimo_error:
                     print(f"{Colores.ROJO}[!] {self.ultimo_error}{Colores.RESET}")
@@ -457,6 +553,12 @@ class ClienteJuegos:
                 return
 
     def solicitar_juegos(self):
+        """Solicita la lista de juegos al servidor y permite crear una sala.
+
+        Espera hasta 5 s la respuesta del servidor (evento de sincronización).
+        Si el usuario elige un juego válido, envía CREAR_SALA y queda en
+        espera hasta que la sala se confirme o la partida empiece.
+        """
         os.system("clear" if os.name == "posix" else "cls")
         self.evento_respuesta.clear()
         Protocolo.enviar(self.socket, {"tipo": "LISTAR_JUEGOS"})
@@ -488,6 +590,12 @@ class ClienteJuegos:
                         return
 
     def solicitar_salas(self):
+        """Solicita la lista de salas disponibles al servidor.
+
+        Espera hasta 5 s la respuesta. Permite al usuario ingresar un ID de
+        sala para unirse; si la partida ya inició devuelve el control al
+        bucle de menu_principal para que modo_partida() tome el control.
+        """
         os.system("clear" if os.name == "posix" else "cls")
         self.evento_respuesta.clear()
         Protocolo.enviar(self.socket, {"tipo": "LISTAR_SALAS"})
@@ -534,6 +642,12 @@ class ClienteJuegos:
                         return
 
     def crear_sala(self):
+        """Flujo completo de creación de sala desde el menú principal.
+
+        Muestra los juegos disponibles, solicita el ID de juego, envía
+        CREAR_SALA y muestra la sala de espera. Un hilo secundario lee el
+        input de cancelación (0+Enter) sin bloquear la detección de partida.
+        """
         os.system("clear" if os.name == "posix" else "cls")
         self.evento_respuesta.clear()
         Protocolo.enviar(self.socket, {"tipo": "LISTAR_JUEGOS"})
@@ -599,6 +713,12 @@ class ClienteJuegos:
                 return
 
     def unirse_sala(self):
+        """Flujo completo para unirse a una sala existente desde el menú.
+
+        Solicita la lista de salas disponibles, muestra la lista y pide
+        al usuario el ID de sala. Una vez enviado UNIRSE_SALA espera hasta
+        que la sala sea aceptada o la partida inicie.
+        """
         os.system("clear" if os.name == "posix" else "cls")
         self.evento_respuesta.clear()
         Protocolo.enviar(self.socket, {"tipo": "LISTAR_SALAS"})
@@ -635,6 +755,11 @@ class ClienteJuegos:
                             return
 
     def solicitar_estadisticas(self):
+        """Solicita las estadísticas globales al servidor y las muestra.
+
+        Espera hasta 5 s la respuesta y delega la visualización a
+        mostrar_estadisticas().
+        """
         os.system("clear" if os.name == "posix" else "cls")
         self.evento_respuesta.clear()
         Protocolo.enviar(self.socket, {"tipo": "ESTADISTICAS"})
@@ -651,6 +776,11 @@ class ClienteJuegos:
 
 
     def enviar_movimiento(self, movimiento):
+        """Envía un movimiento al servidor con el contexto actual de sala y jugador.
+
+        Args:
+            movimiento: Cadena con la posición o columna elegida por el jugador.
+        """
         if DEBUG:
             print(f"[DEBUG] Enviando movimiento: {movimiento} | sala={self.sala_id} | jugador={self.jugador_id}")
         if self.sala_id and self.jugador_id:
@@ -665,6 +795,7 @@ class ClienteJuegos:
             )
 
     def enviar_rendicion(self):
+        """Envía la señal de rendición al servidor y marca la partida como terminada."""
         if self.sala_id:
             Protocolo.enviar(
                 self.socket,
@@ -677,6 +808,11 @@ class ClienteJuegos:
         self.en_partida = False
 
     def enviar_chat(self, mensaje):
+        """Envía un mensaje de chat a la sala actual del jugador.
+
+        Args:
+            mensaje: Texto a enviar (puede incluir comandos como /stats).
+        """
         if self.sala_id:
             Protocolo.enviar(
                 self.socket,
@@ -770,13 +906,13 @@ class ClienteJuegos:
         # --- Movimiento (solo si es mi turno) ---
         if mi_turno:
             try:
-                pos = int(entrada)
-                self.esperando_actualizacion.clear()
+                pos = int(entrada)              # Convertir a número
+                self.esperando_actualizacion.clear()  # Preparar el evento antes de enviar
                 self.enviar_movimiento(str(pos))
-                # Bloquear hasta recibir ACTUALIZACION del servidor (max 10s)
+                # Bloquear hasta recibir la confirmación del servidor (máx 10 s)
                 self.esperando_actualizacion.wait(timeout=10.0)
             except ValueError:
-                if entrada:
+                if entrada:  # Evitar mostrar error si el usuario sólo presionó Enter
                     print(f"{Colores.ROJO}[ERROR] Ingresa un numero valido{Colores.RESET}")
         else:
             if entrada:
@@ -825,11 +961,18 @@ class ClienteJuegos:
 
 
     def desconectar(self):
+        """Cierra la conexión TCP con el servidor y detiene el hilo de escucha."""
         self.conectado = False
         if self.socket:
             self.socket.close()
 
     def registrar_nombre_obligatorio(self):
+        """Muestra la pantalla de bienvenida y obliga al jugador a registrar un nombre.
+
+        Repite la solicitud hasta que el servidor confirme el nombre o la
+        conexión se interrumpa. El nombre debe tener entre 3 y 20 caracteres
+        y no estar en uso por otro jugador activo en la sesión.
+        """
         os.system("clear" if os.name == "posix" else "cls")
         print(f"{Colores.BOLD}{Colores.HEADER}")
         print("╔══════════════════════════════════════╗")
@@ -860,6 +1003,12 @@ class ClienteJuegos:
                 print(f"{Colores.ROJO}[ERROR] El nombre debe tener entre 3 y 20 caracteres.{Colores.RESET}")
 
     def iniciar(self):
+        """Punto de entrada principal del cliente.
+
+        Establece la conexión, registra el nombre del jugador y arranca el
+        bucle del menú principal. Si la conexión falla, termina sin lanzar
+        excepción.
+        """
         if not self.conectar():
             return
 
@@ -872,6 +1021,7 @@ if __name__ == "__main__":
     host = "localhost"
     puerto = 8888
 
+    # Aceptar host y puerto como argumentos de línea de comandos
     if len(sys.argv) > 2:
         host = sys.argv[1]
         puerto = int(sys.argv[2])
@@ -883,5 +1033,6 @@ if __name__ == "__main__":
     try:
         cliente.iniciar()
     except KeyboardInterrupt:
+        # El usuario presionó Ctrl+C: desconectar limpiamente
         print(f"\n{Colores.AMARILLO}[DESCONEXION] Hasta luego!{Colores.RESET}")
         cliente.desconectar()

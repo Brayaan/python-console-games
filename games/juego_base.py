@@ -1,25 +1,27 @@
-# Contrato (interfaz abstracta) que deben implementar todos los juegos del servidor
+# Clase base que deben extender todos los juegos del servidor.
+# Define la estructura mínima que cada juego tiene que implementar.
 class JuegoBase:
+    """Interfaz común para todos los juegos (Triqui, Conecta 4, etc.)."""
 
     def __init__(self):
-        self.turno  = None         # ID del jugador con el turno actual (estado compartido entre hilos)
-        self.estado = "ESPERANDO"  # maquina de estados: ESPERANDO → JUGANDO → TERMINADO
-        self.jugadores = []        # lista de IDs asignados por el servidor al conectarse
-        self.ganador = None
+        self.turno    = None         # ID del jugador que debe mover ahora
+        self.estado   = "ESPERANDO" # Estado actual: ESPERANDO → JUGANDO → TERMINADO
+        self.jugadores = []          # Lista con los IDs de los dos jugadores
+        self.ganador  = None         # ID del jugador ganador (None si no terminó o hubo empate)
 
     def iniciar(self, jugadores_ids):
-        # Transicion de estado al unirse el segundo jugador; llamado desde el hilo del servidor
-        self.jugadores = jugadores_ids
-        self.estado = "JUGANDO"
+        """Arranca la partida cuando los dos jugadores ya están conectados."""
+        self.jugadores = jugadores_ids  # Guardar los IDs de ambos jugadores
+        self.estado = "JUGANDO"          # Cambiar estado para permitir movimientos
 
     def procesar_movimiento(self, jugador_id, movimiento):
-        # Retorna (valido: bool, resultado: dict); debe ser implementado por cada juego
-        raise NotImplementedError
+        """Valida y aplica un movimiento. Cada juego debe implementar este método."""
+        raise NotImplementedError  # Obliga a que los juegos hijos lo definan
 
     def obtener_vista(self, jugador_id):
-        # Vista personalizada por jugador; se serializa a JSON y se envia por socket
-        raise NotImplementedError
+        """Devuelve el estado del tablero adaptado para un jugador específico."""
+        raise NotImplementedError  # Cada juego decide qué información enviar
 
     def obtener_vista_publica(self):
-        # Vista final compartida; se transmite a ambos jugadores al terminar la partida
-        raise NotImplementedError
+        """Devuelve el tablero final que se muestra a ambos jugadores al terminar."""
+        raise NotImplementedError  # Cada juego decide el formato del resultado final
