@@ -1,3 +1,2 @@
 #!/bin/bash
-python3 run_server.py
-read -p "Presiona enter para salir..."
+gnome-terminal -- bash -c "python3 run_server.py; echo ''; read -p 'Presiona enter para salir...'"
