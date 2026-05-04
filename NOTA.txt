@@ -9,6 +9,10 @@ El cliente NUNCA usa `localhost` cuando se conecta a otra máquina. Siempre debe
 3. El cliente en otra máquina se conecta usando la IP del servidor
 
 ## 🐧 SI EL SERVIDOR ESTÁ EN LINUX (VMWARE)
+
+En Linux ejecuta esto antes del servidor:
+sudo ufw allow 8888
+
 Servidor:
 python3 run_server.py
 
