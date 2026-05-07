@@ -1,0 +1,17 @@
+Cuando quieras jugar, haces esto en orden:
+
+net user jugador Poli123* /add
+net start sshd
+netsh advfirewall firewall set rule name="sshd" new enable=yes
+python C:\Users\Kevin\Documents\SistemasOperativos\PIF\PIF\run_server.py
+
+Cuando termines:
+cmd
+net stop sshd
+netsh advfirewall firewall set rule name="sshd" new enable=no
+net user jugador /delete
+
+
+sc query sshd
+
+netsh advfirewall firewall show rule name="sshd"
